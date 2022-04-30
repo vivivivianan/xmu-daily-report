@@ -1,38 +1,26 @@
-import json
-import logging
+import calendar
 import os
+import random
 import time
-import traceback
 from typing import List
 
-import random
-import calendar
-
-import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
 
-debug = os.getenv("ENV") == "debug"
+import webdriver
+from config import Config, make_configs
+from job import click_given_xpath, click_mytable, dropdown_province, dropdown_city, dropdown_district, dropdown_confirm, \
+    dropdown_inschool, dropdown_campus, dropdown_stay_in_school, dropdown_building, text_room, dropdown_indorm, \
+    click_save
+from log import logger
+from utils import fail, send_mail, debug
+from webdriver import close
 
-chrome_options = Options()
-# 谷歌文档提到需要加上这个属性来规避bug
-chrome_options.add_argument('--disable-gpu')
-# 隐藏滚动条, 应对一些特殊页面
-chrome_options.add_argument('--hide-scrollbars')
-# 不加载图片, 提升速度
-chrome_options.add_argument('blink-settings=imagesEnabled=false')
-
-# 日志配置
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-vpn_login_url = 'http://webvpn.xmu.edu.cn/https/77726476706e69737468656265737421e8fa5484207e705d6b468ca88d1b203b/login'
-vpn_checkin_url = 'http://webvpn.xmu.edu.cn/https/77726476706e69737468656265737421e8fa5484207e705d6b468ca88d1b203b/app/214'
-direct_login_url = 'http://xmuxg.xmu.edu.cn/login'
-direct_checkin_url = 'http://xmuxg.xmu.edu.cn/app/214'
-mail_server_url = 'http://120.77.39.85:8080/mail/daily_report'
+# consts
+VPN_LOGIN_URL = 'http://webvpn.xmu.edu.cn/https/77726476706e69737468656265737421e8fa5484207e705d6b468ca88d1b203b/login'
+VPN_CHECKIN_URL = 'http://webvpn.xmu.edu.cn/https/77726476706e69737468656265737421e8fa5484207e705d6b468ca88d1b203b/app/214'
+DIRECT_LOGIN_URL = 'http://xmuxg.xmu.edu.cn/login'
+DIRECT_CHECKIN_URL = 'http://xmuxg.xmu.edu.cn/app/214'
 
 
 def random_second() -> int:
@@ -45,229 +33,136 @@ def unix_timestamp() -> int:
     return ts
 
 
-def checkin(username, passwd, passwd_vpn, use_vpn=True):
-    output = ""
-    if debug:
-        driver = webdriver.Edge()
-    else:
-        driver = webdriver.Chrome(options=chrome_options)
-    driver.maximize_window()
-    login_url = vpn_login_url if use_vpn else direct_login_url
-    checkin_url = vpn_checkin_url if use_vpn else direct_checkin_url
-
+def checkin(cfg: Config, use_vpn=True) -> None:
+    login_url = VPN_LOGIN_URL if use_vpn else DIRECT_LOGIN_URL
+    checkin_url = VPN_CHECKIN_URL if use_vpn else DIRECT_CHECKIN_URL
+    driver = webdriver.get()
     logger.info("准备工作完成")
 
     # 进入登录页面
+    logger.info("正在请求登录页面")
     driver.get(login_url)
-
-    logger.info("请求页面")
 
     if use_vpn:
         # 首先登陆WebVPN，根据上面url在WebVPN登陆成功后会自动跳转打卡登录界面
-        logintab = driver.find_element_by_class_name('login-box')
+        logintab = driver.find_element(By.CLASS_NAME, 'login-box')
         login = WebDriverWait(driver, 10).until(
-            lambda x: x.find_element_by_id('login'))
-        user = logintab.find_element_by_id('user_name')
-        pwd = logintab.find_element_by_xpath(
+            lambda x: x.find_element(By.ID, 'login'))
+        user = logintab.find_element(By.ID, 'user_name')
+        pwd = logintab.find_element(
+            By.XPATH,
             "//*[@id='form']/div[3]/div/input")
-        user.send_keys(username)
-        pwd.send_keys(passwd_vpn)
+        user.send_keys(cfg.username)
+        pwd.send_keys(cfg.password_vpn)
         login.click()
+        logger.info("VPN登录完成")
         time.sleep(1)
 
     # 选择统一身份认证登录跳转到真正的登录页面
-    login = WebDriverWait(driver, 10).until(
-        lambda x: x.find_element_by_xpath("//button[contains(text(),'统一身份认证')]"))
-    login.click()
+    click_given_xpath(driver, '//*[@id="loginLayout"]/div[3]/div[2]/div/button[3]', "统一身份认证")
 
     # 查找页面元素，如果某些元素查找不到则返回错误
-    while True:
-        try:
-            logger.info("进入登录页面")
-            logintab = driver.find_element_by_class_name('auth_tab_content')
-            login = WebDriverWait(driver, 10).until(
-                lambda x: x.find_element_by_xpath("//*[@id='casLoginForm']/p[4]/button"))
-            user = logintab.find_element_by_id('username')
-            pwd = logintab.find_element_by_id('password')
-            logger.info("已定位到元素")
-            break
-        except Exception as e:
-            logger.warning(e)
-            logger.info("未定位到元素!")
-            driver.close()
-            return '打卡失败'
+    try:
+        logger.info("进入XMUXG登录页面")
+        logintab = driver.find_element(By.CLASS_NAME, 'auth_tab_content')
+        login = WebDriverWait(driver, 10).until(
+            lambda x: x.find_element(By.XPATH, "//*[@id='casLoginForm']/p[4]/button"))
+        user = logintab.find_element(By.ID, 'username')
+        pwd = logintab.find_element(By.ID, 'password')
+    except Exception as e:
+        logger.error(e)
+        raise RuntimeError("XMUXG登录失败", e)
 
     # 输入用户名密码并点击登录
-    user.send_keys(username)
-    pwd.send_keys(passwd)
+    user.send_keys(cfg.username)
+    pwd.send_keys(cfg.password)
     login.click()
 
     # 重新跳转到打卡页面
     driver.get(checkin_url)
 
-    # 获取 “我的表单”
-    while True:
-        try:
-            form = WebDriverWait(driver, 10).until(lambda x: x.find_element_by_xpath(
-                "//*[@id='mainM']/div/div/div/div[1]/div[2]/div/div[3]/div[2]"))
-            form.click()
-            logger.info("获取\"我的表单\"成功")
-            break
-        except Exception as e:
-            logger.warning(e)
-            traceback.print_exc()
-            logger.info("获取\"我的表单\"失败")
-            driver.close()
-            return '打卡失败'
+    # 开始工作
+    click_given_xpath(driver, '//*[@id="mainM"]/div/div/div/div[1]/div[2]/div/div[3]/div[2]', "我的表单")
 
-    # 查找框内文本
-    while True:
-        try:
-            text = WebDriverWait(driver, 10).until(
-                lambda x: x.find_element_by_xpath("//*[@id='select_1582538939790']/div/div/span[1]").text)
-            logger.info("查找框内文本成功")
-            break
-        except Exception as e:
-            logger.warning(e)
-            logger.info("查找框内文本失败")
-            driver.close()
-            return '打卡失败'
+    job = click_mytable()
+    job.add_child(
+        dropdown_province("福建省"),
+        dropdown_city("厦门市"),
+        dropdown_district(cfg.district),
+        dropdown_inschool(cfg.inschool).add_child(
+            dropdown_campus(cfg.campus),
+            dropdown_stay_in_school("住校内"),
+            dropdown_indorm("住校内学生宿舍"),
+            dropdown_building(cfg.building),
+            text_room(cfg.room)
+        ) if cfg.inschool.startswith("在校") else
+        dropdown_inschool(cfg.inschool),
+        dropdown_confirm(),
+        click_save()
+    )
+    job.do()
 
-    # 定位填“是”的页面
-    if text == '请选择':
-        while True:
-            try:
-                yes = WebDriverWait(driver, 10).until(
-                    lambda x: x.find_element_by_xpath("//*[@id='select_1582538939790']/div/div"))
-                yes.click()
-                logger.info("点击\"是\"成功")
-                break
-            except Exception as e:
-                logger.warning(e)
-                logger.info("点击\"是\"失败")
-                driver.close()
-                return '打卡失败'
-
-        while True:
-            try:
-                yes = WebDriverWait(driver, 10).until(
-                    lambda x: x.find_element_by_xpath("/html/body/div[8]/ul/div/div[3]/li/label"))
-                yes.click()
-                logger.info("确认\"是\"成功")
-                break
-            except Exception as e:
-                logger.warning(e)
-                logger.info("确认\"是\"失败")
-                driver.close()
-                return '打卡失败'
-
-        # 点击保存按钮
+    try:
         if not debug:
-            save = WebDriverWait(driver, 10).until(
-                lambda x: x.find_element_by_xpath("//span[starts-with(text(),'保存')][1]"))
-            save.click()
-
-        time.sleep(1)
-        # 保存确定
-        try:
-            if not debug:
-                driver.switch_to.alert.accept()
-            time.sleep(1)
-            output = '打卡成功'
-        except Exception as e:
-            traceback.print_exc()
-            output = '打卡失败'
-    else:
-        output = '今日已打卡'
-    driver.close()
-    return output
-
-
-def send_mail(msg: str, title: str, to: str):
-    if not debug:
-        post = requests.post(mail_server_url, data=json.dumps(
-            {"title": title, "body": msg, "dest": to}))
-        return post
+            driver.switch_to.alert.accept()
+        else:
+            driver.switch_to.alert.dismiss()
+    except Exception as e:
+        fail("存在没有正确填写的部分，请向作者反馈", "打卡失败", cfg.email, e, shutdown=False, run_fail=True)
+    time.sleep(1)
+    logger.info("打卡成功")
+    send_mail(f"账号【{cfg.username}】打卡成功", "打卡成功", cfg.email)
 
 
 CONFIG_KEYS = ["username", "password", "password_vpn", "email"]
 
 
-def fail(msg: str, title: str, email: str = "", e: Exception = None, shutdown=True, run_fail=False):
-    logger.warning(msg)
-    if e is not None:
-        logger.error(e)
-        traceback.print_exc()
-    if run_fail:
-        raise RuntimeError(msg)
-    if shutdown:
-        send_mail(msg, title, email)
-        exit(0)
-
-
-def get_configs() -> List[dict]:
-    try:
-        if debug:
-            with open("config.json") as f:
-                configs = json.load(f)["config"]
-        else:
-            configs = json.loads(os.getenv("CONFIG"))["config"]
-        for i, config in enumerate(configs):
-            for k in CONFIG_KEYS:
-                if k not in config.keys():
-                    fail(f"第{i + 1}个配置缺少配置项{k}", "配置错误", run_fail=True)
-                if not isinstance(config[k], str):
-                    fail(f"第{i + 1}个配置的配置项{k}不是字符串，请加上双引号",
-                         "配置错误", run_fail=True)
-        return configs
-    except Exception as e:
-        fail("配置读取失败，请检查配置", "配置错误", e=e, run_fail=True)
+def get_configs() -> List[Config]:
+    if debug:
+        with open("config.json", encoding="utf8") as f:
+            return make_configs(f.read())
+    else:
+        return make_configs(os.getenv("CONFIG"))
 
 
 def main():
-    # 10次重试
     configs = get_configs()
-    for config in configs:
+    logger.info(f"已配置 {len(configs)} 个账号")
+    for cfg in configs:
+        logger.info(f"账号【{cfg.username}】正在运行")
         success = False
         for i in range(1, 2 if debug else 11):
             logger.info(f'第{i}次尝试')
             try:
-                output = checkin(
-                    config["username"],
-                    config["password"],
-                    config["password_vpn"]
-                )
-                logger.info(output)
-                if output != "打卡失败":
-                    send_mail(
-                        f"账号【{config['username']}】{output}", "打卡成功", config["email"])
-                    success = True
-                    break
-                logger.info("通过VPN打卡失败，尝试直接连接")
-                output = checkin(
-                    config["username"],
-                    config["password"],
-                    config["password_vpn"], False
-                )
-                if output != "打卡失败":
-                    send_mail(
-                        f"账号【{config['username']}】{output}", "打卡成功", config["email"])
-                    success = True
-                    break
+                checkin(cfg, False)
+                success = True
+                break
             except Exception as e:
-                fail("尝试失败", "打卡失败", "", e, shutdown=False)
+                fail("直连打卡失败，尝试VPN", "打卡失败", "", e, shutdown=False)
+                if debug:
+                    break
+                try:
+                    checkin(cfg, True)
+                    success = True
+                    break
+                except Exception as e:
+                    fail("尝试失败", "打卡失败", "", e, shutdown=False)
         if not success:
-            fail(f"账号【{config['username']}】重试10次后依然打卡失败，请排查日志",
-                 "打卡失败", config["email"])
+            fail(f"账号【{cfg.username}】重试10次后依然打卡失败，请排查日志",
+                 "打卡失败", cfg.email, shutdown=False)
 
 
 if __name__ == '__main__':
-    
-    time_start: int = unix_timestamp()
-    time_end: int = time_start + random_second()
 
-    while True:
-        if unix_timestamp() > time_end:
-            break
+    if not debug and time.localtime().tm_hour < 11:
+        time_start: int = unix_timestamp()
+        time_end: int = time_start + random_second()
 
-    main()
+        while True:
+            if unix_timestamp() > time_end:
+                break
+    try:
+        main()
+    finally:
+        if not debug:
+            close()
